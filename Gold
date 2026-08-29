@@ -1,0 +1,339 @@
+//+------------------------------------------------------------------+
+//|                              Golden Triangle Strategy EA.mq5     |
+//|                         Automated Liquidity Sweep Trader         |
+//+------------------------------------------------------------------+
+#property copyright "Golden Triangle Strategy"
+#property version   "1.00"
+#property strict
+
+//--- Input Parameters
+input group "=== Risk Management ==="
+input double RiskPercent = 1.0;
+input double MinRiskReward = 2.0;
+input int    MaxTradesPerDay = 3;
+
+input group "=== Strategy Settings ==="
+input int    SwingLength = 5;
+input double FVGThreshold = 0.5;
+input bool   TradeLondon = true;
+input bool   TradeNewYork = true;
+
+input group "=== Trading Hours (Server Time) ==="
+input int    LondonStartHour = 7;
+input int    LondonEndHour = 10;
+input int    NYStartHour = 13;
+input int    NYEndHour = 16;
+
+input group "=== Money Management ==="
+input double StopLossPoints = 50;
+input double TakeProfitPoints = 150;
+input bool   UseBreakEven = true;
+input double BreakEvenTrigger = 50;
+input double BreakEvenProfit = 10;
+
+//--- Global Variables
+datetime lastTradeDate = 0;
+int tradesToday = 0;
+double lastPivotHigh = 0;
+double lastPivotLow = 0;
+int lastPivotHighBar = 0;
+int lastPivotLowBar = 0;
+bool sweepDetected = false;
+string sweepType = "";
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Golden Triangle Strategy EA Initialized");
+   if(_Symbol != "XAUUSD" && _Symbol != "Gold")
+      Print("WARNING: Optimized for XAUUSD");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("EA Deinitialized");
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   
+   if(currentBarTime == lastBarTime) return;
+   lastBarTime = currentBarTime;
+   
+   if(iTime(_Symbol, PERIOD_D1, 0) != lastTradeDate)
+   {
+      tradesToday = 0;
+      lastTradeDate = iTime(_Symbol, PERIOD_D1, 0);
+   }
+   
+   if(tradesToday >= MaxTradesPerDay) return;
+   if(!IsInTradingSession()) return;
+   
+   if(PositionsTotal() > 0)
+   {
+      ManagePositions();
+      return;
+   }
+   
+   DetectPivots();
+   if(sweepDetected) CheckEntrySetup();
+}
+
+//+------------------------------------------------------------------+
+void DetectPivots()
+{
+   int pivotBar = SwingLength;
+   if(pivotBar >= iBars(_Symbol, PERIOD_CURRENT) - 1) return;
+   
+   bool isPivotHigh = true;
+   for(int i = 1; i <= SwingLength; i++)
+   {
+      if(iHigh(_Symbol, PERIOD_CURRENT, pivotBar + i) >= iHigh(_Symbol, PERIOD_CURRENT, pivotBar) ||
+         iHigh(_Symbol, PERIOD_CURRENT, pivotBar - i) >= iHigh(_Symbol, PERIOD_CURRENT, pivotBar))
+      {
+         isPivotHigh = false;
+         break;
+      }
+   }
+   
+   if(isPivotHigh)
+   {
+      double newPH = iHigh(_Symbol, PERIOD_CURRENT, pivotBar);
+      if(newPH != lastPivotHigh)
+      {
+         lastPivotHigh = newPH;
+         lastPivotHighBar = pivotBar;
+      }
+   }
+   
+   bool isPivotLow = true;
+   for(int i = 1; i <= SwingLength; i++)
+   {
+      if(iLow(_Symbol, PERIOD_CURRENT, pivotBar + i) <= iLow(_Symbol, PERIOD_CURRENT, pivotBar) ||
+         iLow(_Symbol, PERIOD_CURRENT, pivotBar - i) <= iLow(_Symbol, PERIOD_CURRENT, pivotBar))
+      {
+         isPivotLow = false;
+         break;
+      }
+   }
+   
+   if(isPivotLow)
+   {
+      double newPL = iLow(_Symbol, PERIOD_CURRENT, pivotBar);
+      if(newPL != lastPivotLow)
+      {
+         lastPivotLow = newPL;
+         lastPivotLowBar = pivotBar;
+      }
+   }
+   
+   DetectSweep();
+}
+
+//+------------------------------------------------------------------+
+void DetectSweep()
+{
+   sweepDetected = false;
+   sweepType = "";
+   
+   if(lastPivotHigh == 0 || lastPivotLow == 0) return;
+   
+   double curLow = iLow(_Symbol, PERIOD_CURRENT, 0);
+   double curClose = iClose(_Symbol, PERIOD_CURRENT, 0);
+   double curHigh = iHigh(_Symbol, PERIOD_CURRENT, 0);
+   
+   if(curLow < lastPivotLow && curClose > lastPivotLow)
+   {
+      sweepDetected = true;
+      sweepType = "BULLISH";
+      Print("BULLISH SWEEP at ", lastPivotLow);
+   }
+   
+   if(curHigh > lastPivotHigh && curClose < lastPivotHigh)
+   {
+      sweepDetected = true;
+      sweepType = "BEARISH";
+      Print("BEARISH SWEEP at ", lastPivotHigh);
+   }
+}
+
+//+------------------------------------------------------------------+
+void CheckEntrySetup()
+{
+   if(SwingLength + 2 >= iBars(_Symbol, PERIOD_CURRENT)) return;
+   
+   double fvgTop = 0, fvgBottom = 0;
+   bool fvgFound = false;
+   
+   if(sweepType == "BULLISH")
+   {
+      if(iLow(_Symbol, PERIOD_CURRENT, 0) > iHigh(_Symbol, PERIOD_CURRENT, 2))
+      {
+         fvgTop = iLow(_Symbol, PERIOD_CURRENT, 0);
+         fvgBottom = iHigh(_Symbol, PERIOD_CURRENT, 2);
+         if((fvgTop - fvgBottom) >= FVGThreshold) fvgFound = true;
+      }
+   }
+   else if(sweepType == "BEARISH")
+   {
+      if(iHigh(_Symbol, PERIOD_CURRENT, 0) < iLow(_Symbol, PERIOD_CURRENT, 2))
+      {
+         fvgTop = iLow(_Symbol, PERIOD_CURRENT, 2);
+         fvgBottom = iHigh(_Symbol, PERIOD_CURRENT, 0);
+         if((fvgTop - fvgBottom) >= FVGThreshold) fvgFound = true;
+      }
+   }
+   
+   if(!fvgFound) return;
+   
+   bool choCh = false;
+   if(sweepType == "BULLISH")
+   {
+      if(iClose(_Symbol, PERIOD_CURRENT, 0) > iHigh(_Symbol, PERIOD_CURRENT, 1))
+         choCh = true;
+   }
+   else
+   {
+      if(iClose(_Symbol, PERIOD_CURRENT, 0) < iLow(_Symbol, PERIOD_CURRENT, 1))
+         choCh = true;
+   }
+   
+   if(choCh) EnterTrade(sweepType, fvgTop, fvgBottom);
+}
+
+//+------------------------------------------------------------------+
+void EnterTrade(string type, double fvgTop, double fvgBottom)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   
+   double price = (type == "BULLISH") ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lotSize = CalculateLotSize(RiskPercent);
+   
+   double sl = 0, tp = 0;
+   
+   if(type == "BULLISH")
+   {
+      sl = price - StopLossPoints * _Point;
+      tp = price + TakeProfitPoints * _Point;
+      if((tp - price) / (price - sl) < MinRiskReward) return;
+   }
+   else
+   {
+      sl = price + StopLossPoints * _Point;
+      tp = price - TakeProfitPoints * _Point;
+      if((price - tp) / (sl - price) < MinRiskReward) return;
+   }
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lotSize;
+   request.type = (type == "BULLISH") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   request.price = price;
+   request.sl = sl;
+   request.tp = tp;
+   request.deviation = 10;
+   request.magic = 123456;
+   request.comment = "Golden Triangle";
+   
+   if(OrderSend(request, result))
+   {
+      if(result.retcode == TRADE_RETCODE_DONE)
+      {
+         tradesToday++;
+         Print("Trade opened! ", type, " | Lots: ", lotSize, " | Entry: ", price);
+      }
+   }
+   else Print("OrderSend error: ", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+double CalculateLotSize(double riskPercent)
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * (riskPercent / 100.0);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   if(tickSize == 0) tickSize = _Point;
+   
+   double lotSize = riskAmount / (StopLossPoints * tickValue / tickSize);
+   
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lotStep == 0) lotStep = 0.01;
+   
+   lotSize = MathFloor(lotSize / lotStep) * lotStep;
+   lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
+   
+   return NormalizeDouble(lotSize, 2);
+}
+
+//+------------------------------------------------------------------+
+bool IsInTradingSession()
+{
+   MqlDateTime timeNow;
+   TimeToStruct(TimeCurrent(), timeNow);
+   int h = timeNow.hour;
+   
+   bool london = TradeLondon && (h >= LondonStartHour && h < LondonEndHour);
+   bool ny = TradeNewYork && (h >= NYStartHour && h < NYEndHour);
+   
+   return (london || ny);
+}
+
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != 123456) continue;
+      
+      if(UseBreakEven)
+      {
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double curSL = PositionGetDouble(POSITION_SL);
+         double curTP = PositionGetDouble(POSITION_TP);
+         double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         long posType = PositionGetInteger(POSITION_TYPE);
+         
+         if(posType == POSITION_TYPE_BUY)
+         {
+            if(price - openPrice >= BreakEvenTrigger * _Point && curSL < openPrice)
+               ModifyPosition(ticket, openPrice + BreakEvenProfit * _Point, curTP);
+         }
+         else
+         {
+            if(openPrice - price >= BreakEvenTrigger * _Point && curSL > openPrice)
+               ModifyPosition(ticket, openPrice - BreakEvenProfit * _Point, curTP);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+void ModifyPosition(ulong ticket, double sl, double tp)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   
+   request.action = TRADE_ACTION_SLTP;
+   request.position = ticket;
+   request.sl = sl;
+   request.tp = tp;
+   
+   if(!OrderSend(request, result))
+      Print("Modify error: ", GetLastError());
+   else
+      Print("Position modified. SL: ", sl, " TP: ", tp);
+}
+//+------------------------------------------------------------------+
