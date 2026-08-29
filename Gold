@@ -1,30 +1,25 @@
 //+------------------------------------------------------------------+
-//|                              Simple Golden Triangle EA.mq5       |
-//|                         Simplified Version - Guaranteed to Work  |
+//|                         Golden Triangle EA - Fixed Version       |
 //+------------------------------------------------------------------+
-#property copyright "Simple Golden Triangle"
-#property version   "2.00"
+#property copyright "Golden Triangle Fixed"
+#property version   "3.00"
 #property strict
 
-//--- Input Parameters
 input group "=== Risk Management ==="
 input double RiskPercent = 1.0;
-input double MinRiskReward = 2.0;
+input double MinRiskReward = 1.5;
 input int    MaxTradesPerDay = 5;
 
 input group "=== Strategy Settings ==="
 input int    SwingLength = 3;
-input double FVGThreshold = 0.3;
-input bool   TradeAllSessions = true;
+input double FVGThreshold = 0.2;
+input double SweepThreshold = 0.5;  // NEW: حداقل فاصله برای Sweep
 
 input group "=== Money Management ==="
 input double StopLossPoints = 100;
 input double TakeProfitPoints = 300;
 input bool   UseBreakEven = true;
-input double BreakEvenTrigger = 100;
-input double BreakEvenProfit = 20;
 
-//--- Global Variables
 datetime lastTradeDate = 0;
 int tradesToday = 0;
 double lastPivotHigh = 0;
@@ -35,8 +30,7 @@ string sweepType = "";
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("=== Simple Golden Triangle EA Started ===");
-   Print("Symbol: ", _Symbol, " Period: ", _Period);
+   Print("=== Golden Triangle EA - Fixed Version ===");
    return(INIT_SUCCEEDED);
 }
 
@@ -55,45 +49,26 @@ void OnTick()
    if(currentBarTime == lastBarTime) return;
    lastBarTime = currentBarTime;
    
-   // Reset daily counter
    if(iTime(_Symbol, PERIOD_D1, 0) != lastTradeDate)
    {
       tradesToday = 0;
       lastTradeDate = iTime(_Symbol, PERIOD_D1, 0);
-      Print("New day started. Trades reset to 0");
    }
    
-   if(tradesToday >= MaxTradesPerDay)
-   {
-      Print("Max trades reached for today: ", tradesToday);
-      return;
-   }
+   if(tradesToday >= MaxTradesPerDay) return;
+   if(PositionsTotal() > 0) { ManagePositions(); return; }
    
-   if(PositionsTotal() > 0)
-   {
-      ManagePositions();
-      return;
-   }
-   
-   // Detect pivots every bar
    DetectPivots();
-   
-   if(sweepDetected)
-   {
-      Print("Sweep detected: ", sweepType);
-      CheckEntrySetup();
-   }
+   if(sweepDetected) CheckEntrySetup();
 }
 
 //+------------------------------------------------------------------+
 void DetectPivots()
 {
    int pivotBar = SwingLength;
-   int totalBars = iBars(_Symbol, PERIOD_CURRENT);
+   if(pivotBar >= iBars(_Symbol, PERIOD_CURRENT) - 2) return;
    
-   if(pivotBar >= totalBars - 2) return;
-   
-   // Detect Pivot High
+   // Pivot High
    bool isPH = true;
    double phValue = iHigh(_Symbol, PERIOD_CURRENT, pivotBar);
    
@@ -110,10 +85,10 @@ void DetectPivots()
    if(isPH && phValue != lastPivotHigh)
    {
       lastPivotHigh = phValue;
-      Print("New Pivot High detected at: ", lastPivotHigh);
+      Print("Pivot High: ", lastPivotHigh);
    }
    
-   // Detect Pivot Low
+   // Pivot Low
    bool isPL = true;
    double plValue = iLow(_Symbol, PERIOD_CURRENT, pivotBar);
    
@@ -130,10 +105,9 @@ void DetectPivots()
    if(isPL && plValue != lastPivotLow)
    {
       lastPivotLow = plValue;
-      Print("New Pivot Low detected at: ", lastPivotLow);
+      Print("Pivot Low: ", lastPivotLow);
    }
    
-   // Detect Sweep
    DetectSweep();
 }
 
@@ -143,116 +117,95 @@ void DetectSweep()
    sweepDetected = false;
    sweepType = "";
    
-   if(lastPivotHigh == 0 || lastPivotLow == 0)
+   if(lastPivotHigh == 0 || lastPivotLow == 0) return;
+   
+   double curHigh = iHigh(_Symbol, PERIOD_CURRENT, 0);
+   double curLow = iLow(_Symbol, PERIOD_CURRENT, 0);
+   double curClose = iClose(_Symbol, PERIOD_CURRENT, 0);
+   double curOpen = iOpen(_Symbol, PERIOD_CURRENT, 0);
+   
+   // BULLISH SWEEP: price touches/breaks pivot low but shows strength
+   // NEW: یا قیمت زیر Pivot Low رفت، یا خیلی نزدیک شد + کندل صعودی
+   if(curLow <= lastPivotLow)
    {
-      Print("No pivots detected yet. PH=", lastPivotHigh, " PL=", lastPivotLow);
-      return;
+      // شرط ۱: قیمت زیر Pivot Low رفت
+      bool brokeBelow = (curLow < lastPivotLow);
+      
+      // شرط ۲: کندل صعودی است یا برگشتی
+      bool bullishCandle = (curClose > curOpen);
+      
+      // شرط ۳: قیمت به Pivot Low نزدیک شده (حداقل SweepThreshold)
+      bool nearPivot = ((lastPivotLow - curLow) >= SweepThreshold * _Point);
+      
+      if((brokeBelow || nearPivot) && bullishCandle)
+      {
+         sweepDetected = true;
+         sweepType = "BULLISH";
+         Print(">>> BULLISH SWEEP <<< Low=", curLow, " PivotLow=", lastPivotLow);
+      }
    }
    
-   double currentLow = iLow(_Symbol, PERIOD_CURRENT, 0);
-   double currentHigh = iHigh(_Symbol, PERIOD_CURRENT, 0);
-   double currentClose = iClose(_Symbol, PERIOD_CURRENT, 0);
-   
-   Print("Checking sweep... Current: H=", currentHigh, " L=", currentLow, " C=", currentClose);
-   Print("Last Pivot High=", lastPivotHigh, " Last Pivot Low=", lastPivotLow);
-   
-   // Bullish Sweep: price goes below pivot low but closes above
-   if(currentLow < lastPivotLow && currentClose > lastPivotLow)
+   // BEARISH SWEEP: price touches/breaks pivot high but shows weakness
+   if(curHigh >= lastPivotHigh)
    {
-      sweepDetected = true;
-      sweepType = "BULLISH";
-      Print(">>> BULLISH SWEEP DETECTED <<<");
-   }
-   
-   // Bearish Sweep: price goes above pivot high but closes below
-   if(currentHigh > lastPivotHigh && currentClose < lastPivotHigh)
-   {
-      sweepDetected = true;
-      sweepType = "BEARISH";
-      Print(">>> BEARISH SWEEP DETECTED <<<");
+      bool brokeAbove = (curHigh > lastPivotHigh);
+      bool bearishCandle = (curClose < curOpen);
+      bool nearPivot = ((curHigh - lastPivotHigh) >= SweepThreshold * _Point);
+      
+      if((brokeAbove || nearPivot) && bearishCandle)
+      {
+         sweepDetected = true;
+         sweepType = "BEARISH";
+         Print(">>> BEARISH SWEEP <<< High=", curHigh, " PivotHigh=", lastPivotHigh);
+      }
    }
 }
 
 //+------------------------------------------------------------------+
 void CheckEntrySetup()
 {
-   int totalBars = iBars(_Symbol, PERIOD_CURRENT);
-   if(totalBars < 3) return;
+   if(iBars(_Symbol, PERIOD_CURRENT) < 3) return;
    
    double fvgTop = 0, fvgBottom = 0;
    bool fvgFound = false;
    
    if(sweepType == "BULLISH")
    {
-      double currentLow = iLow(_Symbol, PERIOD_CURRENT, 0);
-      double twoBarsAgoHigh = iHigh(_Symbol, PERIOD_CURRENT, 2);
-      
-      if(currentLow > twoBarsAgoHigh)
+      // FVG: Low current > High 2 bars ago
+      if(iLow(_Symbol, PERIOD_CURRENT, 0) > iHigh(_Symbol, PERIOD_CURRENT, 2))
       {
-         fvgTop = currentLow;
-         fvgBottom = twoBarsAgoHigh;
-         double fvgSize = fvgTop - fvgBottom;
-         
-         if(fvgSize >= FVGThreshold)
-         {
-            fvgFound = true;
-            Print("Bullish FVG found: ", fvgBottom, " to ", fvgTop, " Size=", fvgSize);
-         }
+         fvgTop = iLow(_Symbol, PERIOD_CURRENT, 0);
+         fvgBottom = iHigh(_Symbol, PERIOD_CURRENT, 2);
+         if((fvgTop - fvgBottom) >= FVGThreshold) fvgFound = true;
       }
    }
    else if(sweepType == "BEARISH")
    {
-      double currentHigh = iHigh(_Symbol, PERIOD_CURRENT, 0);
-      double twoBarsAgoLow = iLow(_Symbol, PERIOD_CURRENT, 2);
-      
-      if(currentHigh < twoBarsAgoLow)
+      // FVG: High current < Low 2 bars ago
+      if(iHigh(_Symbol, PERIOD_CURRENT, 0) < iLow(_Symbol, PERIOD_CURRENT, 2))
       {
-         fvgTop = twoBarsAgoLow;
-         fvgBottom = currentHigh;
-         double fvgSize = fvgTop - fvgBottom;
-         
-         if(fvgSize >= FVGThreshold)
-         {
-            fvgFound = true;
-            Print("Bearish FVG found: ", fvgBottom, " to ", fvgTop, " Size=", fvgSize);
-         }
+         fvgTop = iLow(_Symbol, PERIOD_CURRENT, 2);
+         fvgBottom = iHigh(_Symbol, PERIOD_CURRENT, 0);
+         if((fvgTop - fvgBottom) >= FVGThreshold) fvgFound = true;
       }
    }
    
-   if(!fvgFound)
-   {
-      Print("No FVG found. Trade skipped.");
-      return;
-   }
+   if(!fvgFound) return;
    
-   // Check ChoCh
+   // ChoCh
    bool choCh = false;
    if(sweepType == "BULLISH")
    {
       if(iClose(_Symbol, PERIOD_CURRENT, 0) > iHigh(_Symbol, PERIOD_CURRENT, 1))
-      {
          choCh = true;
-         Print("Bullish ChoCh confirmed");
-      }
    }
    else
    {
       if(iClose(_Symbol, PERIOD_CURRENT, 0) < iLow(_Symbol, PERIOD_CURRENT, 1))
-      {
          choCh = true;
-         Print("Bearish ChoCh confirmed");
-      }
    }
    
-   if(choCh)
-   {
-      Print("All conditions met! Entering trade...");
-      EnterTrade(sweepType, fvgTop, fvgBottom);
-   }
-   else
-   {
-      Print("No ChoCh. Trade skipped.");
-   }
+   if(choCh) EnterTrade(sweepType, fvgTop, fvgBottom);
 }
 
 //+------------------------------------------------------------------+
@@ -270,35 +223,13 @@ void EnterTrade(string type, double fvgTop, double fvgBottom)
    {
       sl = price - StopLossPoints * _Point;
       tp = price + TakeProfitPoints * _Point;
-      
-      double risk = price - sl;
-      double reward = tp - price;
-      double rr = reward / risk;
-      
-      Print("BULLISH Trade: Entry=", price, " SL=", sl, " TP=", tp, " R:R=", rr);
-      
-      if(rr < MinRiskReward)
-      {
-         Print("R:R too low: ", rr, ". Trade skipped.");
-         return;
-      }
+      if((tp - price) / (price - sl) < MinRiskReward) return;
    }
    else
    {
       sl = price + StopLossPoints * _Point;
       tp = price - TakeProfitPoints * _Point;
-      
-      double risk = sl - price;
-      double reward = price - tp;
-      double rr = reward / risk;
-      
-      Print("BEARISH Trade: Entry=", price, " SL=", sl, " TP=", tp, " R:R=", rr);
-      
-      if(rr < MinRiskReward)
-      {
-         Print("R:R too low: ", rr, ". Trade skipped.");
-         return;
-      }
+      if((price - tp) / (sl - price) < MinRiskReward) return;
    }
    
    request.action = TRADE_ACTION_DEAL;
@@ -310,29 +241,15 @@ void EnterTrade(string type, double fvgTop, double fvgBottom)
    request.tp = tp;
    request.deviation = 10;
    request.magic = 123456;
-   request.comment = "Simple Golden Triangle";
-   
-   Print("Sending order...");
+   request.comment = "Golden Triangle Fixed";
    
    if(OrderSend(request, result))
    {
       if(result.retcode == TRADE_RETCODE_DONE)
       {
          tradesToday++;
-         Print(">>> TRADE OPENED SUCCESSFULLY <<<");
-         Print("Type: ", type, " | Lots: ", lotSize, " | Entry: ", price);
-         Print("SL: ", sl, " | TP: ", tp);
-         Print("Trades today: ", tradesToday);
+         Print(">>> TRADE OPENED: ", type, " Lots=", lotSize, " Price=", price);
       }
-      else
-      {
-         Print("Trade failed. Retcode: ", result.retcode);
-         Print("Comment: ", result.comment);
-      }
-   }
-   else
-   {
-      Print("OrderSend failed. Error: ", GetLastError());
    }
 }
 
@@ -343,21 +260,16 @@ double CalculateLotSize(double riskPercent)
    double riskAmount = balance * (riskPercent / 100.0);
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   
    if(tickSize == 0) tickSize = _Point;
    
    double lotSize = riskAmount / (StopLossPoints * tickValue / tickSize);
-   
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   
    if(lotStep == 0) lotStep = 0.01;
    
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
    lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
-   
-   Print("Calculated lot size: ", lotSize);
    
    return NormalizeDouble(lotSize, 2);
 }
@@ -376,23 +288,18 @@ void ManagePositions()
       {
          double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          double curSL = PositionGetDouble(POSITION_SL);
-         double curTP = PositionGetDouble(POSITION_TP);
          double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          long posType = PositionGetInteger(POSITION_TYPE);
          
          if(posType == POSITION_TYPE_BUY)
          {
-            if(price - openPrice >= BreakEvenTrigger * _Point && curSL < openPrice)
-            {
-               ModifyPosition(ticket, openPrice + BreakEvenProfit * _Point, curTP);
-            }
+            if(price - openPrice >= 100 * _Point && curSL < openPrice)
+               ModifyPosition(ticket, openPrice + 20 * _Point, PositionGetDouble(POSITION_TP));
          }
          else
          {
-            if(openPrice - price >= BreakEvenTrigger * _Point && curSL > openPrice)
-            {
-               ModifyPosition(ticket, openPrice - BreakEvenProfit * _Point, curTP);
-            }
+            if(openPrice - price >= 100 * _Point && curSL > openPrice)
+               ModifyPosition(ticket, openPrice - 20 * _Point, PositionGetDouble(POSITION_TP));
          }
       }
    }
@@ -403,15 +310,10 @@ void ModifyPosition(ulong ticket, double sl, double tp)
 {
    MqlTradeRequest request = {};
    MqlTradeResult result = {};
-   
    request.action = TRADE_ACTION_SLTP;
    request.position = ticket;
    request.sl = sl;
    request.tp = tp;
-   
-   if(!OrderSend(request, result))
-      Print("Modify error: ", GetLastError());
-   else
-      Print("Position modified. SL=", sl, " TP=", tp);
+   OrderSend(request, result);
 }
 //+------------------------------------------------------------------+
