@@ -1,27 +1,27 @@
 //+------------------------------------------------------------------+
 //|                                          LiquidityHunter_EA.mq5  |
-//|              نسخه نهایی با خطاگیری کامل و تنظیمات ساده‌تر        |
+//|              نسخه مخصوص بک‌تست و اجرای واقعی (اصلاح Time)       |
 //+------------------------------------------------------------------+
 #property copyright "Liquidity Hunter EA"
-#property version   "3.00"
+#property version   "4.00"
 #property strict
 
 #include <Trade/Trade.mqh>
 
 //+------------------------------------------------------------------+
-//| ورودی‌ها (تنظیمات ساده‌تر)                                       |
+//| ورودی‌ها                                                         |
 //+------------------------------------------------------------------+
-input int      InpMagicNumber    = 20260829;      // شماره جادویی
-input double   InpRiskPercent    = 2.0;           // ریسک به درصد
-input int      InpATRPeriod      = 14;            // دوره ATR
-input int      InpPivotBars      = 5;             // تعداد کندل سوئینگ
-input double   InpRiskReward     = 3.0;           // نسبت ریسک به ریوارد
-input int      InpHTF_Timeframe  = 60;            // تایم بالاتر (۶۰=۱ساعته)
-input int      InpEMA_Period     = 50;            // دوره EMA
-input bool     InpUseTrailing    = true;          // تریلینگ استاپ
-input double   InpTrailingATR    = 0.3;           // ضریب تریلینگ
-input int      InpMaxSpread      = 150;           // حداکثر اسپرد (پیپ)
-input bool     InpDebugMode      = true;          // حالت دیباگ
+input int      InpMagicNumber    = 20260829;      
+input double   InpRiskPercent    = 2.0;           
+input int      InpATRPeriod      = 14;            
+input int      InpPivotBars      = 5;             
+input double   InpRiskReward     = 3.0;           
+input int      InpHTF_Timeframe  = 60;            // 60=1ساعته | 240=4ساعته
+input int      InpEMA_Period     = 50;            
+input bool     InpUseTrailing    = true;          
+input double   InpTrailingATR    = 0.3;           
+input int      InpMaxSpread      = 150;           
+input bool     InpDebugMode      = true;          
 
 //+------------------------------------------------------------------+
 //| متغیرهای سراسری                                                  |
@@ -33,12 +33,10 @@ int            m_emaHandle = INVALID_HANDLE;
 string         m_symbol;
 ENUM_TIMEFRAMES m_timeframe;
 
-// متغیرهای سوئینگ
 double         m_lastSwingHigh = 0;
 double         m_lastSwingLow  = 0;
 int            m_lastSwingBar  = 0;
 
-// متغیرهای سیگنال
 double         m_entryLevel   = 0;
 double         m_slLevel      = 0;
 double         m_tp1Level     = 0;
@@ -47,8 +45,11 @@ double         m_tp3Level     = 0;
 int            m_signalType   = 0;
 datetime       m_lastSignalTime = 0;
 
+// *** متغیر جدید برای تشخیص کندل جدید در بک‌تست و ریل‌تایم ***
+datetime       m_lastBarTime = 0;
+
 //+------------------------------------------------------------------+
-//| تابع شروع – با خطاگیری کامل                                      |
+//| تابع شروع                                                        |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -56,41 +57,33 @@ int OnInit()
    m_timeframe = Period();
    m_trade.SetExpertMagicNumber(m_magic);
    
-   Print("🔧 در حال راه‌اندازی ربات روی نماد: ", m_symbol, " تایم: ", EnumToString(m_timeframe));
+   Print("🔧 راه‌اندازی ربات روی: ", m_symbol, " | تایم: ", EnumToString(m_timeframe));
    
-   // ایجاد هندل ATR
+   // ایجاد ATR
    m_atrHandle = iATR(m_symbol, m_timeframe, InpATRPeriod);
    if(m_atrHandle == INVALID_HANDLE)
    {
-      Print("❌ خطا در ایجاد ATR Handle! کد خطا: ", GetLastError());
-      Print("   ⚠️ ممکن است نماد یا تایم‌فریم نامعتبر باشد.");
+      Print("❌ خطا در ATR! کد: ", GetLastError());
       return INIT_FAILED;
    }
    
-   // ایجاد هندل EMA (در تایم بالاتر)
+   // ایجاد EMA (تایم بالاتر)
    ENUM_TIMEFRAMES htf = (ENUM_TIMEFRAMES)InpHTF_Timeframe;
-   if(htf < PERIOD_M1 || htf > PERIOD_W1)
-   {
-      Print("❌ تایم‌فریم بالاتر نامعتبر: ", InpHTF_Timeframe);
-      Print("   ⚠️ عدد ۶۰ برای ۱ساعته، ۲۴۰ برای ۴ساعته");
-      return INIT_FAILED;
-   }
-   
    m_emaHandle = iMA(m_symbol, htf, InpEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
    if(m_emaHandle == INVALID_HANDLE)
    {
-      Print("❌ خطا در ایجاد EMA Handle! کد خطا: ", GetLastError());
-      Print("   ⚠️ ممکن است تایم‌فریم بالاتر (", EnumToString(htf), ") داده کافی نداشته باشد.");
+      Print("❌ خطا در EMA! کد: ", GetLastError());
       return INIT_FAILED;
    }
    
    // مقداردهی اولیه سوئینگ‌ها
    FindLastSwingPoints();
    
-   Print("✅ ربات با موفقیت راه‌اندازی شد!");
-   Print("📊 آخرین قله: ", m_lastSwingHigh, " | آخرین دره: ", m_lastSwingLow);
-   Print("📈 تایم بالاتر: ", EnumToString(htf), " | EMA دوره: ", InpEMA_Period);
+   // مقداردهی اولیه زمان آخرین کندل
+   m_lastBarTime = iTime(m_symbol, m_timeframe, 0);
    
+   Print("✅ ربات راه‌اندازی شد!");
+   Print("📊 آخرین قله: ", m_lastSwingHigh, " | دره: ", m_lastSwingLow);
    return INIT_SUCCEEDED;
 }
 
@@ -101,15 +94,15 @@ void OnDeinit(const int reason)
 {
    if(m_atrHandle != INVALID_HANDLE) IndicatorRelease(m_atrHandle);
    if(m_emaHandle != INVALID_HANDLE) IndicatorRelease(m_emaHandle);
-   Print("🛑 ربات متوقف شد. کد: ", reason);
+   Print("🛑 ربات متوقف شد.");
 }
 
 //+------------------------------------------------------------------+
-//| تابع اصلی – هر تیک جدید                                          |
+//| تابع اصلی (حلقه هر تیک)                                          |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // اگر معامله‌ای باز است مدیریت کن
+   // مدیریت پوزیشن‌های باز
    if(PositionExists())
    {
       ManageOpenPositions();
@@ -130,28 +123,35 @@ void OnTick()
    double currentHigh = iHigh(m_symbol, m_timeframe, 1);
    double currentLow  = iLow(m_symbol, m_timeframe, 1);
    
-   // جهت بازار (بر اساس EMA تایم بالاتر)
    bool isUptrend = (currentClose > htfEMA);
    
-   // به‌روزرسانی نقاط سوئینگ در هر کندل جدید
-   static datetime lastBarTime = 0;
-   if(TimeCurrent() - lastBarTime >= PeriodSeconds(m_timeframe))
+   // *** اصلاح مهم: تشخیص کندل جدید با iTime (هم برای بک‌تست و هم ریل‌تایم) ***
+   datetime currentBarTime = iTime(m_symbol, m_timeframe, 0);
+   if(currentBarTime != m_lastBarTime)
    {
+      // یک کندل جدید بسته شده است
+      m_lastBarTime = currentBarTime;
+      
+      // به‌روزرسانی نقاط سوئینگ
       UpdateSwingPoints();
-      lastBarTime = TimeCurrent();
       
       if(InpDebugMode)
-         Print("🔄 سوئینگ‌ها: قله=", DoubleToString(m_lastSwingHigh, _Digits), 
-               " دره=", DoubleToString(m_lastSwingLow, _Digits));
+         Print("🔄 [", TimeToString(currentBarTime), "] سوئینگ‌ها: قله=", 
+               DoubleToString(m_lastSwingHigh, _Digits), " دره=", DoubleToString(m_lastSwingLow, _Digits));
+   }
+   else
+   {
+      // اگر کندل جدیدی نبسته شده، کاری نکن (برای کاهش بار پردازشی)
+      return;
    }
    
-   // تشخیص شکست سوئینگ
+   // تشخیص شکست سوئینگ (با استفاده از کندل شماره 1 که همین الان بسته شده)
    bool isBreakBuy  = (currentHigh > m_lastSwingHigh && iHigh(m_symbol, m_timeframe, 2) <= m_lastSwingHigh);
    bool isBreakSell = (currentLow  < m_lastSwingLow  && iLow(m_symbol, m_timeframe, 2)  >= m_lastSwingLow);
    
    if(isBreakBuy || isBreakSell)
    {
-      int barIndex = 1;
+      int barIndex = 1; // کندل شکننده
       double barOpen  = iOpen(m_symbol, m_timeframe, barIndex);
       double barClose = iClose(m_symbol, m_timeframe, barIndex);
       double barHigh  = iHigh(m_symbol, m_timeframe, barIndex);
@@ -174,8 +174,7 @@ void OnTick()
       }
       else
       {
-         if(InpDebugMode) Print("⛔ جهت همخوانی ندارد (روند: ", isUptrend ? "خرید" : "فروش", 
-                                 " | سیگنال: ", isBreakBuy ? "خرید" : "فروش", ")");
+         if(InpDebugMode) Print("⛔ جهت همخوانی ندارد.");
          return;
       }
       
@@ -183,7 +182,6 @@ void OnTick()
       if(TimeCurrent() - m_lastSignalTime < 60) return;
       m_lastSignalTime = TimeCurrent();
       
-      // محاسبه اهداف
       double slDist = MathAbs(m_entryLevel - m_slLevel);
       if(slDist < SymbolInfoDouble(m_symbol, SYMBOL_POINT) * 10) return;
       
@@ -194,12 +192,11 @@ void OnTick()
       
       Print("========================================");
       Print("📢 **سیگنال جدید شناسایی شد!**");
-      Print("   نوع: ", (m_signalType == 1) ? "خرید (BUY)" : "فروش (SELL)");
+      Print("   نوع: ", (m_signalType == 1) ? "خرید" : "فروش");
       Print("   ورود (لیمیت): ", DoubleToString(m_entryLevel, _Digits));
       Print("   حد ضرر: ", DoubleToString(m_slLevel, _Digits));
-      Print("   هدف 1 (0.5 ATR): ", DoubleToString(m_tp1Level, _Digits));
-      Print("   هدف 2 (باز روزانه): ", DoubleToString(m_tp2Level, _Digits));
-      Print("   هدف 3 (1:3): ", DoubleToString(m_tp3Level, _Digits));
+      Print("   هدف 1: ", DoubleToString(m_tp1Level, _Digits));
+      Print("   هدف 3: ", DoubleToString(m_tp3Level, _Digits));
       Print("========================================");
       
       PlaceLimitOrder();
@@ -207,7 +204,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| پیدا کردن آخرین نقاط سوئینگ                                      |
+//| پیدا کردن نقاط سوئینگ                                            |
 //+------------------------------------------------------------------+
 void FindLastSwingPoints()
 {
@@ -216,8 +213,7 @@ void FindLastSwingPoints()
    
    for(int i = 10; i < bars && i < 300; i++)
    {
-      bool isHigh = true;
-      bool isLow  = true;
+      bool isHigh = true, isLow = true;
       double h = iHigh(m_symbol, m_timeframe, i);
       double l = iLow(m_symbol, m_timeframe, i);
       
@@ -239,7 +235,7 @@ void FindLastSwingPoints()
 }
 
 //+------------------------------------------------------------------+
-//| به‌روزرسانی نقاط سوئینگ                                          |
+//| به‌روزرسانی سوئینگ‌ها                                             |
 //+------------------------------------------------------------------+
 void UpdateSwingPoints()
 {
@@ -248,8 +244,7 @@ void UpdateSwingPoints()
    
    for(int i = start; i < bars - InpPivotBars; i++)
    {
-      bool isHigh = true;
-      bool isLow  = true;
+      bool isHigh = true, isLow = true;
       double h = iHigh(m_symbol, m_timeframe, i);
       double l = iLow(m_symbol, m_timeframe, i);
       
@@ -272,7 +267,7 @@ void UpdateSwingPoints()
 }
 
 //+------------------------------------------------------------------+
-//| دریافت ATR                                                       |
+//| توابع دریافت داده                                                |
 //+------------------------------------------------------------------+
 double GetATR()
 {
@@ -282,9 +277,6 @@ double GetATR()
    return arr[0];
 }
 
-//+------------------------------------------------------------------+
-//| دریافت EMA تایم بالاتر                                           |
-//+------------------------------------------------------------------+
 double GetHTF_EMA()
 {
    double arr[];
@@ -293,9 +285,6 @@ double GetHTF_EMA()
    return arr[0];
 }
 
-//+------------------------------------------------------------------+
-//| دریافت قیمت باز روزانه                                           |
-//+------------------------------------------------------------------+
 double GetDailyOpen()
 {
    MqlRates rates[];
@@ -304,23 +293,17 @@ double GetDailyOpen()
    return rates[0].open;
 }
 
-//+------------------------------------------------------------------+
-//| بررسی اسپرد                                                      |
-//+------------------------------------------------------------------+
 bool CheckSpread()
 {
    double spread = (SymbolInfoDouble(m_symbol, SYMBOL_ASK) - SymbolInfoDouble(m_symbol, SYMBOL_BID)) / SymbolInfoDouble(m_symbol, SYMBOL_POINT);
    if(spread > InpMaxSpread)
    {
-      if(InpDebugMode && MathRand()%10 == 0) Print("⚠️ اسپرد بالا: ", DoubleToString(spread, 0), " پیپ");
+      if(InpDebugMode && MathRand()%10 == 0) Print("⚠️ اسپرد بالا: ", DoubleToString(spread, 0));
       return false;
    }
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| بررسی وجود پوزیشن باز                                            |
-//+------------------------------------------------------------------+
 bool PositionExists()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -335,9 +318,6 @@ bool PositionExists()
    return false;
 }
 
-//+------------------------------------------------------------------+
-//| ثبت سفارش لیمیت                                                  |
-//+------------------------------------------------------------------+
 void PlaceLimitOrder()
 {
    double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * (InpRiskPercent / 100.0);
@@ -363,14 +343,11 @@ void PlaceLimitOrder()
       result = m_trade.SellLimit(lot, m_entryLevel, m_symbol, m_slLevel, m_tp1Level, ORDER_TIME_GTC, 0, "LH SELL");
    
    if(result)
-      Print("✅ سفارش با موفقیت ثبت شد! تیکت: ", m_trade.ResultOrder());
+      Print("✅ سفارش ثبت شد! تیکت: ", m_trade.ResultOrder());
    else
       Print("❌ خطا در ثبت سفارش! کد: ", GetLastError());
 }
 
-//+------------------------------------------------------------------+
-//| مدیریت پوزیشن‌های باز                                            |
-//+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
    if(!InpUseTrailing) return;
@@ -387,14 +364,12 @@ void ManageOpenPositions()
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double profit = PositionGetDouble(POSITION_PROFIT);
       
-      // بریک‌ایون
       if(profit > 0 && currentSL != openPrice)
       {
          if(m_trade.PositionModify(t, openPrice, PositionGetDouble(POSITION_TP)))
-            Print("🔒 بریک‌ایون فعال شد!");
+            Print("🔒 بریک‌ایون!");
       }
       
-      // تریلینگ
       double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
       double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
       double trailDist = atr * InpTrailingATR;
@@ -406,7 +381,7 @@ void ManageOpenPositions()
             (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && newSL < currentSL))
          {
             if(m_trade.PositionModify(t, newSL, PositionGetDouble(POSITION_TP)))
-               Print("📈 تریلینگ به‌روز شد: ", DoubleToString(newSL, _Digits));
+               Print("📈 تریلینگ: ", DoubleToString(newSL, _Digits));
          }
       }
    }
