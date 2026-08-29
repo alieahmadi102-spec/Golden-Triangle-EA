@@ -1,319 +1,426 @@
 //+------------------------------------------------------------------+
-//|                         Golden Triangle EA - Fixed Version       |
+//|                                          LiquidityHunter_EA.mq5  |
+//|                    استراتژی شکار نقدینگی - ۵۰٪ بدنه + ATR        |
 //+------------------------------------------------------------------+
-#property copyright "Golden Triangle Fixed"
-#property version   "3.00"
+#property copyright "Liquidity Hunter EA"
+#property version   "1.00"
 #property strict
 
-input group "=== Risk Management ==="
-input double RiskPercent = 1.0;
-input double MinRiskReward = 1.5;
-input int    MaxTradesPerDay = 5;
+#include <Trade/Trade.mqh>
 
-input group "=== Strategy Settings ==="
-input int    SwingLength = 3;
-input double FVGThreshold = 0.2;
-input double SweepThreshold = 0.5;  // NEW: حداقل فاصله برای Sweep
+//+------------------------------------------------------------------+
+//| ورودی‌های ربات (قابل تنظیم در پنجره تنظیمات MT5)                 |
+//+------------------------------------------------------------------+
+input int      InpMagicNumber    = 20260829;      // شماره جادویی (شناسه ربات)
+input double   InpRiskPercent    = 2.0;           // ریسک به درصد از سرمایه (٪)
+input int      InpATRPeriod      = 14;            // دوره ATR
+input int      InpPivotBars      = 5;             // تعداد کندل برای تشخیص سوئینگ
+input double   InpRiskReward     = 3.0;           // نسبت ریسک به ریوارد هدف سوم
+input int      InpHTF_Timeframe  = PERIOD_H1;     // تایم‌فریم بالاتر (مثلاً 60 برای ۱ساعته)
+input int      InpEMA_Period     = 50;            // دوره EMA
+input bool     InpUseTrailing    = true;          // استفاده از تریلینگ استاپ
+input double   InpTrailingATR    = 0.3;           // ضریب ATR برای تریلینگ استاپ
+input int      InpMaxSpread      = 50;            // حداکثر اسپرد مجاز (پیپ)
 
-input group "=== Money Management ==="
-input double StopLossPoints = 100;
-input double TakeProfitPoints = 300;
-input bool   UseBreakEven = true;
+//+------------------------------------------------------------------+
+//| متغیرهای سراسری                                                  |
+//+------------------------------------------------------------------+
+CTrade         m_trade;                           // ابزار معاملاتی
+ulong          m_magic = InpMagicNumber;          // شماره جادویی
+int            m_atrHandle;                       // Handle اندیکاتور ATR
+int            m_emaHandle;                       // Handle اندیکاتور EMA (تایم بالاتر)
+string         m_symbol;                          // نماد معاملاتی
+ENUM_TIMEFRAMES m_timeframe;                     // تایم‌فریم فعلی
 
-datetime lastTradeDate = 0;
-int tradesToday = 0;
-double lastPivotHigh = 0;
-double lastPivotLow = 0;
-bool sweepDetected = false;
-string sweepType = "";
+// متغیرهای ذخیره سیگنال
+double         m_entryLevel   = 0.0;
+double         m_slLevel      = 0.0;
+double         m_tp1Level     = 0.0;
+double         m_tp2Level     = 0.0;
+double         m_tp3Level     = 0.0;
+int            m_breakoutBar  = 0;
+int            m_signalType   = 0;               // 1=BUY, -1=SELL, 0=هیچ
 
+// متغیرهای تشخیص سوئینگ
+double         m_lastSwingHigh = 0.0;
+double         m_lastSwingLow  = 0.0;
+int            m_lastSwingBar  = 0;
+
+//+------------------------------------------------------------------+
+//| تابع初始化                                                       |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("=== Golden Triangle EA - Fixed Version ===");
+   m_symbol    = Symbol();
+   m_timeframe = Period();
+   m_trade.SetExpertMagicNumber(m_magic);
+   
+   // ایجاد Handle برای ATR
+   m_atrHandle = iATR(m_symbol, m_timeframe, InpATRPeriod);
+   if(m_atrHandle == INVALID_HANDLE)
+   {
+      Print("❌ خطا در ایجاد ATR Handle: ", GetLastError());
+      return(INIT_FAILED);
+   }
+   
+   // ایجاد Handle برای EMA در تایم‌فریم بالاتر
+   m_emaHandle = iMA(m_symbol, (ENUM_TIMEFRAMES)InpHTF_Timeframe, InpEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   if(m_emaHandle == INVALID_HANDLE)
+   {
+      Print("❌ خطا در ایجاد EMA Handle: ", GetLastError());
+      return(INIT_FAILED);
+   }
+   
+   Print("✅ ربات با موفقیت راه‌اندازی شد!");
+   Print("📊 نماد: ", m_symbol, " | تایم‌فریم: ", EnumToString(m_timeframe));
+   Print("📈 تایم‌فریم بالاتر: ", EnumToString((ENUM_TIMEFRAMES)InpHTF_Timeframe));
+   
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
+//| تابع Deinitialization                                            |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   Print("EA Stopped");
+   if(m_atrHandle != INVALID_HANDLE) IndicatorRelease(m_atrHandle);
+   if(m_emaHandle != INVALID_HANDLE) IndicatorRelease(m_emaHandle);
+   Print("🛑 ربات متوقف شد. کد: ", reason);
 }
 
+//+------------------------------------------------------------------+
+//| تابع اصلی - هر تیک جدید                                         |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   static datetime lastBarTime = 0;
-   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
-   
-   if(currentBarTime == lastBarTime) return;
-   lastBarTime = currentBarTime;
-   
-   if(iTime(_Symbol, PERIOD_D1, 0) != lastTradeDate)
+   // بررسی اینکه آیا معامله‌ای باز است
+   if(PositionExists())
    {
-      tradesToday = 0;
-      lastTradeDate = iTime(_Symbol, PERIOD_D1, 0);
+      ManageOpenPositions();
+      return;
    }
    
-   if(tradesToday >= MaxTradesPerDay) return;
-   if(PositionsTotal() > 0) { ManagePositions(); return; }
+   // بررسی اسپرد
+   if(!CheckSpread()) return;
    
-   DetectPivots();
-   if(sweepDetected) CheckEntrySetup();
-}
-
-//+------------------------------------------------------------------+
-void DetectPivots()
-{
-   int pivotBar = SwingLength;
-   if(pivotBar >= iBars(_Symbol, PERIOD_CURRENT) - 2) return;
+   // دریافت داده‌های مورد نیاز
+   double atrValue = GetATR();
+   if(atrValue <= 0) return;
    
-   // Pivot High
-   bool isPH = true;
-   double phValue = iHigh(_Symbol, PERIOD_CURRENT, pivotBar);
+   double htfEMA = GetHTF_EMA();
+   if(htfEMA <= 0) return;
    
-   for(int i = 1; i <= SwingLength; i++)
+   double dailyOpen = GetDailyOpen();
+   double currentClose = iClose(m_symbol, m_timeframe, 1);
+   
+   // تعیین جهت بازار (بر اساس EMA تایم بالاتر)
+   bool isUptrend = (currentClose > htfEMA);
+   
+   // تشخیص کندل شکننده (سوئینگ)
+   DetectSwingPoints();
+   
+   bool isBreakoutBuy  = (currentClose > m_lastSwingHigh && iClose(m_symbol, m_timeframe, 2) <= m_lastSwingHigh);
+   bool isBreakoutSell = (currentClose < m_lastSwingLow  && iClose(m_symbol, m_timeframe, 2) >= m_lastSwingLow);
+   
+   // اگر کندل شکننده تشخیص داده شد
+   if(isBreakoutBuy || isBreakoutSell)
    {
-      if(iHigh(_Symbol, PERIOD_CURRENT, pivotBar - i) >= phValue ||
-         iHigh(_Symbol, PERIOD_CURRENT, pivotBar + i) >= phValue)
-      {
-         isPH = false;
-         break;
-      }
-   }
-   
-   if(isPH && phValue != lastPivotHigh)
-   {
-      lastPivotHigh = phValue;
-      Print("Pivot High: ", lastPivotHigh);
-   }
-   
-   // Pivot Low
-   bool isPL = true;
-   double plValue = iLow(_Symbol, PERIOD_CURRENT, pivotBar);
-   
-   for(int i = 1; i <= SwingLength; i++)
-   {
-      if(iLow(_Symbol, PERIOD_CURRENT, pivotBar - i) <= plValue ||
-         iLow(_Symbol, PERIOD_CURRENT, pivotBar + i) <= plValue)
-      {
-         isPL = false;
-         break;
-      }
-   }
-   
-   if(isPL && plValue != lastPivotLow)
-   {
-      lastPivotLow = plValue;
-      Print("Pivot Low: ", lastPivotLow);
-   }
-   
-   DetectSweep();
-}
-
-//+------------------------------------------------------------------+
-void DetectSweep()
-{
-   sweepDetected = false;
-   sweepType = "";
-   
-   if(lastPivotHigh == 0 || lastPivotLow == 0) return;
-   
-   double curHigh = iHigh(_Symbol, PERIOD_CURRENT, 0);
-   double curLow = iLow(_Symbol, PERIOD_CURRENT, 0);
-   double curClose = iClose(_Symbol, PERIOD_CURRENT, 0);
-   double curOpen = iOpen(_Symbol, PERIOD_CURRENT, 0);
-   
-   // BULLISH SWEEP: price touches/breaks pivot low but shows strength
-   // NEW: یا قیمت زیر Pivot Low رفت، یا خیلی نزدیک شد + کندل صعودی
-   if(curLow <= lastPivotLow)
-   {
-      // شرط ۱: قیمت زیر Pivot Low رفت
-      bool brokeBelow = (curLow < lastPivotLow);
+      // محاسبه ۵۰٪ بدنه
+      double barOpen  = iOpen(m_symbol, m_timeframe, 1);
+      double barClose = iClose(m_symbol, m_timeframe, 1);
+      double barHigh  = iHigh(m_symbol, m_timeframe, 1);
+      double barLow   = iLow(m_symbol, m_timeframe, 1);
       
-      // شرط ۲: کندل صعودی است یا برگشتی
-      bool bullishCandle = (curClose > curOpen);
+      m_entryLevel = (barOpen + barClose) / 2.0;
       
-      // شرط ۳: قیمت به Pivot Low نزدیک شده (حداقل SweepThreshold)
-      bool nearPivot = ((lastPivotLow - curLow) >= SweepThreshold * _Point);
+      if(isBreakoutBuy && isUptrend)  // فقط در جهت روند
+      {
+         m_slLevel    = barLow - (SymbolInfoDouble(m_symbol, SYMBOL_POINT) * 10);
+         m_signalType = 1;
+      }
+      else if(isBreakoutSell && !isUptrend)
+      {
+         m_slLevel    = barHigh + (SymbolInfoDouble(m_symbol, SYMBOL_POINT) * 10);
+         m_signalType = -1;
+      }
+      else
+      {
+         return; // جهت همخوانی ندارد
+      }
       
-      if((brokeBelow || nearPivot) && bullishCandle)
-      {
-         sweepDetected = true;
-         sweepType = "BULLISH";
-         Print(">>> BULLISH SWEEP <<< Low=", curLow, " PivotLow=", lastPivotLow);
-      }
-   }
-   
-   // BEARISH SWEEP: price touches/breaks pivot high but shows weakness
-   if(curHigh >= lastPivotHigh)
-   {
-      bool brokeAbove = (curHigh > lastPivotHigh);
-      bool bearishCandle = (curClose < curOpen);
-      bool nearPivot = ((curHigh - lastPivotHigh) >= SweepThreshold * _Point);
+      // محاسبه اهداف
+      double slDistance = MathAbs(m_entryLevel - m_slLevel);
+      m_tp1Level = m_entryLevel + (0.5 * atrValue) * (m_signalType == 1 ? 1 : -1);
+      m_tp2Level = dailyOpen;
+      m_tp3Level = m_entryLevel + (slDistance * InpRiskReward) * (m_signalType == 1 ? 1 : -1);
       
-      if((brokeAbove || nearPivot) && bearishCandle)
+      m_breakoutBar = iBars(m_symbol, m_timeframe);
+      
+      // بررسی اعتبار سیگنال (حداکثر ۵۰ کندل قبل)
+      if(iBars(m_symbol, m_timeframe) - m_breakoutBar < 50)
       {
-         sweepDetected = true;
-         sweepType = "BEARISH";
-         Print(">>> BEARISH SWEEP <<< High=", curHigh, " PivotHigh=", lastPivotHigh);
+         // ثبت سیگنال در لاگ
+         Print("📢 سیگنال جدید شناسایی شد!");
+         Print("   نوع: ", (m_signalType == 1) ? "BUY" : "SELL");
+         Print("   ورود: ", DoubleToString(m_entryLevel, _Digits));
+         Print("   حد ضرر: ", DoubleToString(m_slLevel, _Digits));
+         Print("   هدف۱: ", DoubleToString(m_tp1Level, _Digits));
+         Print("   هدف۲: ", DoubleToString(m_tp2Level, _Digits));
+         Print("   هدف۳: ", DoubleToString(m_tp3Level, _Digits));
+         
+         // ارسال سفارش لیمیت
+         PlaceLimitOrder();
       }
    }
 }
 
 //+------------------------------------------------------------------+
-void CheckEntrySetup()
+//| دریافت مقدار ATR                                                |
+//+------------------------------------------------------------------+
+double GetATR()
 {
-   if(iBars(_Symbol, PERIOD_CURRENT) < 3) return;
-   
-   double fvgTop = 0, fvgBottom = 0;
-   bool fvgFound = false;
-   
-   if(sweepType == "BULLISH")
+   double atrArray[];
+   ArraySetAsSeries(atrArray, true);
+   if(CopyBuffer(m_atrHandle, 0, 0, 1, atrArray) <= 0)
    {
-      // FVG: Low current > High 2 bars ago
-      if(iLow(_Symbol, PERIOD_CURRENT, 0) > iHigh(_Symbol, PERIOD_CURRENT, 2))
-      {
-         fvgTop = iLow(_Symbol, PERIOD_CURRENT, 0);
-         fvgBottom = iHigh(_Symbol, PERIOD_CURRENT, 2);
-         if((fvgTop - fvgBottom) >= FVGThreshold) fvgFound = true;
-      }
+      Print("⚠️ خطا در دریافت ATR: ", GetLastError());
+      return 0.0;
    }
-   else if(sweepType == "BEARISH")
-   {
-      // FVG: High current < Low 2 bars ago
-      if(iHigh(_Symbol, PERIOD_CURRENT, 0) < iLow(_Symbol, PERIOD_CURRENT, 2))
-      {
-         fvgTop = iLow(_Symbol, PERIOD_CURRENT, 2);
-         fvgBottom = iHigh(_Symbol, PERIOD_CURRENT, 0);
-         if((fvgTop - fvgBottom) >= FVGThreshold) fvgFound = true;
-      }
-   }
-   
-   if(!fvgFound) return;
-   
-   // ChoCh
-   bool choCh = false;
-   if(sweepType == "BULLISH")
-   {
-      if(iClose(_Symbol, PERIOD_CURRENT, 0) > iHigh(_Symbol, PERIOD_CURRENT, 1))
-         choCh = true;
-   }
-   else
-   {
-      if(iClose(_Symbol, PERIOD_CURRENT, 0) < iLow(_Symbol, PERIOD_CURRENT, 1))
-         choCh = true;
-   }
-   
-   if(choCh) EnterTrade(sweepType, fvgTop, fvgBottom);
+   return atrArray[0];
 }
 
 //+------------------------------------------------------------------+
-void EnterTrade(string type, double fvgTop, double fvgBottom)
+//| دریافت EMA از تایم‌فریم بالاتر                                  |
+//+------------------------------------------------------------------+
+double GetHTF_EMA()
 {
-   MqlTradeRequest request = {};
-   MqlTradeResult result = {};
-   
-   double price = (type == "BULLISH") ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double lotSize = CalculateLotSize(RiskPercent);
-   
-   double sl = 0, tp = 0;
-   
-   if(type == "BULLISH")
+   double emaArray[];
+   ArraySetAsSeries(emaArray, true);
+   if(CopyBuffer(m_emaHandle, 0, 0, 1, emaArray) <= 0)
    {
-      sl = price - StopLossPoints * _Point;
-      tp = price + TakeProfitPoints * _Point;
-      if((tp - price) / (price - sl) < MinRiskReward) return;
+      Print("⚠️ خطا در دریافت EMA: ", GetLastError());
+      return 0.0;
    }
-   else
+   return emaArray[0];
+}
+
+//+------------------------------------------------------------------+
+//| دریافت قیمت باز شدن روزانه                                       |
+//+------------------------------------------------------------------+
+double GetDailyOpen()
+{
+   MqlRates dailyRates[];
+   ArraySetAsSeries(dailyRates, true);
+   if(CopyRates(m_symbol, PERIOD_D1, 0, 1, dailyRates) <= 0)
    {
-      sl = price + StopLossPoints * _Point;
-      tp = price - TakeProfitPoints * _Point;
-      if((price - tp) / (sl - price) < MinRiskReward) return;
+      Print("⚠️ خطا در دریافت قیمت باز روزانه: ", GetLastError());
+      return 0.0;
    }
+   return dailyRates[0].open;
+}
+
+//+------------------------------------------------------------------+
+//| تشخیص نقاط سوئینگ (قله و دره)                                   |
+//+------------------------------------------------------------------+
+void DetectSwingPoints()
+{
+   int bars = iBars(m_symbol, m_timeframe);
+   if(bars < InpPivotBars * 2 + 2) return;
    
-   request.action = TRADE_ACTION_DEAL;
-   request.symbol = _Symbol;
-   request.volume = lotSize;
-   request.type = (type == "BULLISH") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   request.price = price;
-   request.sl = sl;
-   request.tp = tp;
-   request.deviation = 10;
-   request.magic = 123456;
-   request.comment = "Golden Triangle Fixed";
-   
-   if(OrderSend(request, result))
+   // بررسی قله (Swing High)
+   for(int i = InpPivotBars; i < bars - InpPivotBars; i++)
    {
-      if(result.retcode == TRADE_RETCODE_DONE)
+      bool isHigh = true;
+      double currentHigh = iHigh(m_symbol, m_timeframe, i);
+      
+      for(int j = 1; j <= InpPivotBars; j++)
       {
-         tradesToday++;
-         Print(">>> TRADE OPENED: ", type, " Lots=", lotSize, " Price=", price);
+         if(iHigh(m_symbol, m_timeframe, i - j) >= currentHigh || 
+            iHigh(m_symbol, m_timeframe, i + j) >= currentHigh)
+         {
+            isHigh = false;
+            break;
+         }
+      }
+      
+      if(isHigh && currentHigh > m_lastSwingHigh)
+      {
+         m_lastSwingHigh = currentHigh;
+         m_lastSwingBar = i;
+      }
+   }
+   
+   // بررسی دره (Swing Low)
+   for(int i = InpPivotBars; i < bars - InpPivotBars; i++)
+   {
+      bool isLow = true;
+      double currentLow = iLow(m_symbol, m_timeframe, i);
+      
+      for(int j = 1; j <= InpPivotBars; j++)
+      {
+         if(iLow(m_symbol, m_timeframe, i - j) <= currentLow || 
+            iLow(m_symbol, m_timeframe, i + j) <= currentLow)
+         {
+            isLow = false;
+            break;
+         }
+      }
+      
+      if(isLow && currentLow > m_lastSwingLow)
+      {
+         m_lastSwingLow = currentLow;
       }
    }
 }
 
 //+------------------------------------------------------------------+
-double CalculateLotSize(double riskPercent)
+//| بررسی اسپرد                                                      |
+//+------------------------------------------------------------------+
+bool CheckSpread()
 {
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount = balance * (riskPercent / 100.0);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tickSize == 0) tickSize = _Point;
-   
-   double lotSize = riskAmount / (StopLossPoints * tickValue / tickSize);
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   if(lotStep == 0) lotStep = 0.01;
-   
-   lotSize = MathFloor(lotSize / lotStep) * lotStep;
-   lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
-   
-   return NormalizeDouble(lotSize, 2);
+   double spread = (SymbolInfoDouble(m_symbol, SYMBOL_ASK) - SymbolInfoDouble(m_symbol, SYMBOL_BID)) / SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+   if(spread > InpMaxSpread)
+   {
+      Print("⚠️ اسپرد بالا: ", DoubleToString(spread, 0), " پیپ");
+      return false;
+   }
+   return true;
 }
 
 //+------------------------------------------------------------------+
-void ManagePositions()
+//| بررسی وجود پوزیشن باز                                            |
+//+------------------------------------------------------------------+
+bool PositionExists()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket <= 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != 123456) continue;
-      
-      if(UseBreakEven)
+      if(PositionSelectByTicket(ticket))
       {
-         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         double curSL = PositionGetDouble(POSITION_SL);
-         double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         long posType = PositionGetInteger(POSITION_TYPE);
-         
-         if(posType == POSITION_TYPE_BUY)
+         if(PositionGetString(POSITION_SYMBOL) == m_symbol && 
+            PositionGetInteger(POSITION_MAGIC) == m_magic)
          {
-            if(price - openPrice >= 100 * _Point && curSL < openPrice)
-               ModifyPosition(ticket, openPrice + 20 * _Point, PositionGetDouble(POSITION_TP));
+            return true;
          }
-         else
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ارسال سفارش لیمیت                                                |
+//+------------------------------------------------------------------+
+void PlaceLimitOrder()
+{
+   // محاسبه حجم معامله بر اساس ریسک
+   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * (InpRiskPercent / 100.0);
+   double slDistance = MathAbs(m_entryLevel - m_slLevel);
+   double tickValue = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lotStep = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_STEP);
+   double lotMin = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+   double lotMax = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MAX);
+   
+   double lot = riskAmount / (slDistance / tickSize * tickValue);
+   lot = MathFloor(lot / lotStep) * lotStep;
+   lot = MathMax(lotMin, MathMin(lotMax, lot));
+   
+   if(lot <= 0)
+   {
+      Print("❌ حجم معامله محاسبه نشد!");
+      return;
+   }
+   
+   // تنظیم قیمت‌ها
+   double entryPrice = m_entryLevel;
+   double slPrice = m_slLevel;
+   double tpPrice = m_tp1Level; // هدف اول (برداشت ۵۰٪)
+   
+   // ارسال سفارش
+   m_trade.SetDeviationInPoints(10);
+   
+   bool result = false;
+   if(m_signalType == 1) // BUY
+   {
+      result = m_trade.BuyLimit(lot, entryPrice, m_symbol, slPrice, tpPrice, ORDER_TIME_GTC, 0, "Liquidity Hunter BUY");
+   }
+   else if(m_signalType == -1) // SELL
+   {
+      result = m_trade.SellLimit(lot, entryPrice, m_symbol, slPrice, tpPrice, ORDER_TIME_GTC, 0, "Liquidity Hunter SELL");
+   }
+   
+   if(result)
+   {
+      Print("✅ سفارش لیمیت با موفقیت ثبت شد!");
+      Print("   تیکت: ", m_trade.ResultOrder());
+   }
+   else
+   {
+      Print("❌ خطا در ثبت سفارش: ", GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| مدیریت پوزیشن‌های باز                                            |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   if(!InpUseTrailing) return;
+   
+   double atrValue = GetATR();
+   if(atrValue <= 0) return;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      
+      if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+      
+      double currentPrice = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 
+                            SymbolInfoDouble(m_symbol, SYMBOL_BID) : 
+                            SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+      
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double profit = PositionGetDouble(POSITION_PROFIT);
+      
+      // اگر سود به هدف اول رسید، حد ضرر را به نقطه ورود ببر (بریک‌ایون)
+      if(profit > 0)
+      {
+         double newSL = openPrice;
+         if(currentSL != newSL)
          {
-            if(openPrice - price >= 100 * _Point && curSL > openPrice)
-               ModifyPosition(ticket, openPrice - 20 * _Point, PositionGetDouble(POSITION_TP));
+            m_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+            Print("🔒 بریک‌ایون فعال شد - حد ضرر به نقطه ورود منتقل شد");
+         }
+      }
+      
+      // تریلینگ استاپ با ضریب ATR
+      double trailDistance = atrValue * InpTrailingATR;
+      double newTrailSL = 0;
+      
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      {
+         newTrailSL = currentPrice - trailDistance;
+      }
+      else
+      {
+         newTrailSL = currentPrice + trailDistance;
+      }
+      
+      // فقط اگر تریلینگ استاپ از حد ضرر فعلی بهتر باشد
+      if((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY && newTrailSL > currentSL) ||
+         (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && newTrailSL < currentSL))
+      {
+         if(currentSL != newTrailSL)
+         {
+            m_trade.PositionModify(ticket, newTrailSL, PositionGetDouble(POSITION_TP));
+            Print("📈 تریلینگ استاپ به‌روزرسانی شد: ", DoubleToString(newTrailSL, _Digits));
          }
       }
    }
 }
 
-//+------------------------------------------------------------------+
-void ModifyPosition(ulong ticket, double sl, double tp)
-{
-   MqlTradeRequest request = {};
-   MqlTradeResult result = {};
-   request.action = TRADE_ACTION_SLTP;
-   request.position = ticket;
-   request.sl = sl;
-   request.tp = tp;
-   OrderSend(request, result);
-}
 //+------------------------------------------------------------------+
